@@ -120,6 +120,9 @@ func handleCommand(ctx *ClientContext, cmd []string, byteCount int) (response st
 			ctx.queuedCmds = nil
 			return "+OK\r\n", false
 
+		case "MULTI":
+			return encodeError("MULTI calls can not be nested"), false
+
 		default:
 			ctx.queuedCmds = append(ctx.queuedCmds, cmd)
 			return "+QUEUED\r\n", false

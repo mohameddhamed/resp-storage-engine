@@ -150,3 +150,20 @@ func TestTTLRaceAndExpiration(t *testing.T) {
 		t.Fatalf("Expired GET expected \"$-1\\r\\n\", got: %q", resp)
 	}
 }
+
+func TestNestedMultiError(t *testing.T) {
+	initTestStore()
+	ctx := &ClientContext{id: 1}
+
+	resp, _ := handleCommand(ctx, []string{"MULTI"}, 0)
+	if resp != "+OK\r\n" {
+		t.Fatalf("MULTI returned: %s", resp)
+	}
+
+	// Nested MULTI must return an error
+	resp, _ = handleCommand(ctx, []string{"MULTI"}, 0)
+	expectedErr := "-ERR MULTI calls can not be nested\r\n"
+	if resp != expectedErr {
+		t.Fatalf("Nested MULTI returned %q, want %q", resp, expectedErr)
+	}
+}

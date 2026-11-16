@@ -32,7 +32,8 @@ func encodeBulkString(s string) string {
 	var b strings.Builder
 	b.Grow(len(s) + 16)
 	b.WriteByte('$')
-	b.WriteString(strconv.Itoa(len(s)))
+	var numBuf [20]byte
+	b.Write(strconv.AppendInt(numBuf[:0], int64(len(s)), 10))
 	b.WriteString("\r\n")
 	b.WriteString(s)
 	b.WriteString("\r\n")
@@ -59,7 +60,8 @@ func encodeInteger(number int) string {
 	var b strings.Builder
 	b.Grow(16)
 	b.WriteByte(':')
-	b.WriteString(strconv.Itoa(number))
+	var numBuf [20]byte
+	b.Write(strconv.AppendInt(numBuf[:0], int64(number), 10))
 	b.WriteString("\r\n")
 	return b.String()
 }
@@ -79,7 +81,8 @@ func encodeStringArray(arr []string) string {
 	var b strings.Builder
 	b.Grow(32 + len(arr)*32)
 	b.WriteByte('*')
-	b.WriteString(strconv.Itoa(len(arr)))
+	var numBuf [20]byte
+	b.Write(strconv.AppendInt(numBuf[:0], int64(len(arr)), 10))
 	b.WriteString("\r\n")
 	for _, s := range arr {
 		b.WriteString(encodeBulkString(s))
