@@ -14,12 +14,9 @@ import (
 
 func configure() {
 	if len(config.replicaofHost) == 0 {
-
 		config.role = "master"
 		config.replid = randReplid()
-
 	} else {
-
 		config.role = "slave"
 		replicaofArgs := strings.Split(config.replicaofHost, " ")
 
@@ -33,52 +30,53 @@ func configure() {
 			os.Exit(1)
 		}
 		config.replicaofHost = replicaofArgs[0]
-
 	}
 }
+
 func connect() {
-	listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", config.port))
+	listener, err := net.Listen("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(config.port)))
 	if err != nil {
 		fmt.Printf("Failed to bind to port %d\n", config.port)
 		os.Exit(1)
 	}
-	fmt.Println("Listening on: ", listener.Addr().String())
-
-	// store = make(map[string]string)
-	// ttl = make(map[string]time.Time)
+	defer listener.Close()
+	fmt.Printf("Listening on: %s\n", listener.Addr().String())
 
 	for id := 1; ; id++ {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("Error accepting connection: ", err.Error())
+			fmt.Printf("Error accepting connection: %v\n", err)
 			os.Exit(1)
 		}
-		multi := -1
-		go serveClient(id, conn, &multi)
+		go serveClient(id, conn)
 	}
 }
+
 func randReplid() string {
-	chars := []byte("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	const chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	result := make([]byte, 40)
 	for i := range result {
-		c := rand.Intn(len(chars))
-		result[i] = chars[c]
+		result[i] = chars[rand.Intn(len(chars))]
 	}
 	return string(result)
 }
-func serveClient(id int, conn net.Conn, multi *int) {
+
+func serveClient(id int, conn net.Conn) {
 	defer conn.Close()
-	fmt.Printf("[#%d] Client connected: %v\n", id, conn.RemoteAddr().String())
+	ctx := &ClientContext{id: id, conn: conn}
+
+	reader := bufio.NewReader(conn)
 
 	for {
-
-		scanner := bufio.NewScanner(conn)
 		cmd := []string{}
 		var arrSize, strSize int
 
-		for scanner.Scan() {
-
-			token := scanner.Text()
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			token := strings.TrimRight(line, "\r\n")
 			cmd, arrSize, strSize = parseCommands(token, arrSize, strSize, cmd)
 
 			if arrSize == 0 {
@@ -86,58 +84,60 @@ func serveClient(id int, conn net.Conn, multi *int) {
 			}
 		}
 
-		// TODO: handle scanner errors
-
 		if len(cmd) == 0 {
 			break
 		}
 
-		fmt.Printf("[#%d] Command = %v\n", id, cmd)
-		response, resynch := handleCommand(cmd, 0, multi)
+		response, resynch := handleCommand(ctx, cmd, 0)
 
 		_, err := conn.Write([]byte(response))
-
 		if err != nil {
-			fmt.Printf("[#%d] Error writing response: %v\n", id, err.Error())
 			break
 		}
 
 		if resynch {
 			sendRDB(conn)
-			replicas = append(replicas, replica{conn, 0})
+			replicaMu.Lock()
+			replicas = append(replicas, replica{conn: conn, offset: 0})
+			replicaMu.Unlock()
 		}
 	}
-
-	fmt.Printf("[#%d] Client closing\n", id)
 }
 
 func handleWait(count, timeout int) string {
 	getAckCmd := []byte(encodeStringArray([]string{"REPLCONF", "GETACK", "*"}))
 
+	replicaMu.Lock()
+	snapshot := make([]replica, len(replicas))
+	copy(snapshot, replicas)
+	replicaMu.Unlock()
+
 	acks := 0
 
-	for i := 0; i < len(replicas); i++ {
-
-		if replicas[i].offset > 0 {
-
-			bytesWritten, _ := replicas[i].conn.Write(getAckCmd)
-			replicas[i].offset += bytesWritten
-
-			go func(conn net.Conn) {
-
-				fmt.Println("waiting response from replica", conn.RemoteAddr().String())
-				buffer := make([]byte, 1024)
-
-				_, err := conn.Read(buffer)
-				if err == nil {
-					fmt.Println("got response from replica", conn.RemoteAddr().String())
-				} else {
-					fmt.Println("error from replica", conn.RemoteAddr().String(), " => ", err.Error())
+	for i := 0; i < len(snapshot); i++ {
+		if snapshot[i].offset > 0 {
+			bytesWritten, err := snapshot[i].conn.Write(getAckCmd)
+			if err == nil {
+				replicaMu.Lock()
+				for j := range replicas {
+					if replicas[j].conn == snapshot[i].conn {
+						replicas[j].offset += bytesWritten
+						break
+					}
 				}
+				replicaMu.Unlock()
 
-				ackReceived <- true
-
-			}(replicas[i].conn)
+				go func(conn net.Conn) {
+					buffer := make([]byte, 1024)
+					_, err := conn.Read(buffer)
+					if err == nil {
+						select {
+						case ackReceived <- true:
+						default:
+						}
+					}
+				}(snapshot[i].conn)
+			}
 		} else {
 			acks++
 		}
@@ -150,39 +150,10 @@ outer:
 		select {
 		case <-ackReceived:
 			acks++
-			fmt.Println("acks =", acks)
 		case <-timer:
-			fmt.Println("timeout! acks =", acks)
 			break outer
 		}
 	}
 
 	return encodeInteger(acks)
-}
-func enQueue(cmd []string, multi *int) string {
-	response := "+QUEUED\r\n"
-	var responses []string
-
-	if strings.ToUpper(cmd[0]) == "DISCARD" {
-
-		*multi = -1
-		config.queuedCmds = [][]string{}
-		return "+OK\r\n"
-
-	} else if strings.ToUpper(cmd[0]) == "EXEC" {
-		execMulti := -1
-		for _, command := range config.queuedCmds {
-			response, _ := handleCommand(command, 0, &execMulti)
-			responses = append(responses, response)
-		}
-
-		flattenedResponses := strings.Join(responses, "")
-		*multi = -1
-		execResponse := fmt.Sprintf("*%d\r\n%s", len(responses), flattenedResponses)
-
-		return execResponse
-
-	}
-	config.queuedCmds = append(config.queuedCmds, cmd)
-	return response
 }

@@ -22,36 +22,38 @@ func handshake(masterConn net.Conn) *bufio.Reader {
 }
 
 func propagate(cmd []string) {
+	replicaMu.Lock()
+	defer replicaMu.Unlock()
+
 	if len(replicas) == 0 {
 		return
 	}
-	for i := 0; i < len(replicas); i++ {
-		fmt.Printf("Replicating to: %s\n", replicas[i].conn.RemoteAddr().String())
-		bytesWritten, err := replicas[i].conn.Write([]byte(encodeStringArray(cmd)))
 
+	msg := []byte(encodeStringArray(cmd))
+	var activeReplicas []replica
+
+	for _, rep := range replicas {
+		bytesWritten, err := rep.conn.Write(msg)
 		if err != nil {
-			replicas = removeReplica(replicas, i)
+			fmt.Printf("Disconnected replica: %s (%v)\n", rep.conn.RemoteAddr().String(), err)
+			rep.conn.Close()
+			continue
 		}
+		rep.offset += bytesWritten
+		activeReplicas = append(activeReplicas, rep)
+	}
 
-		replicas[i].offset += bytesWritten
-	}
-}
-func removeReplica(replicas []replica, i int) []replica {
-	fmt.Printf("Disconnected: %s\n", replicas[i].conn.RemoteAddr().String())
-	if len(replicas) > 1 {
-		last := len(replicas) - 1
-		replicas[i] = replicas[last]
-		replicas = replicas[:last]
-		i--
-	}
-	return replicas
+	replicas = activeReplicas
 }
 
 func handlePropagation(reader *bufio.Reader, masterConn net.Conn, totalProcessedBytes int) {
+	slaveCtx := &ClientContext{id: 0, conn: masterConn}
+
 	for {
 		cmd := []string{}
 		var arrSize, strSize int
 		byteCount := 0
+
 		for {
 			token, err := reader.ReadString('\n')
 			byteCount += len(token)
@@ -66,26 +68,17 @@ func handlePropagation(reader *bufio.Reader, masterConn net.Conn, totalProcessed
 			if arrSize == 0 {
 				break
 			}
-
 		}
-
-		// TODO: handle scanner errors
 
 		if len(cmd) == 0 {
 			break
 		}
 
-		fmt.Printf("[from master] Command = %q\n", cmd)
-		multi := -1
-		response, _ := handleCommand(cmd, totalProcessedBytes, &multi)
+		response, _ := handleCommand(slaveCtx, cmd, totalProcessedBytes)
 		totalProcessedBytes += byteCount
-		fmt.Printf("response = %q\n", response)
 
 		if strings.ToUpper(cmd[0]) == "REPLCONF" {
-
-			fmt.Printf("ack = %q\n", cmd)
 			_, err := masterConn.Write([]byte(response))
-
 			if err != nil {
 				fmt.Printf("Error responding to master: %v\n", err.Error())
 				break

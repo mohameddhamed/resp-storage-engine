@@ -1,11 +1,14 @@
 package main
 
 import (
-	"fmt"
 	"strconv"
+	"strings"
 )
 
 func parseCommands(token string, arrSize int, strSize int, cmd []string) ([]string, int, int) {
+	if len(token) == 0 {
+		return cmd, arrSize, strSize
+	}
 
 	switch token[0] {
 	case '*':
@@ -14,7 +17,6 @@ func parseCommands(token string, arrSize int, strSize int, cmd []string) ([]stri
 		strSize, _ = strconv.Atoi(token[1:])
 	default:
 		if len(token) != strSize {
-			fmt.Printf("[from master] Wrong string size - got: %d, want: %d\n", len(token), strSize)
 			break
 		}
 		arrSize--
@@ -24,24 +26,63 @@ func parseCommands(token string, arrSize int, strSize int, cmd []string) ([]stri
 	return cmd, arrSize, strSize
 }
 
+// encodeBulkString encodes a bulk string in RESP2 format: $<len>\r\n<data>\r\n
+// An empty string is encoded as "$0\r\n\r\n".
 func encodeBulkString(s string) string {
-	if len(s) == 0 {
-		return "$-1\r\n"
-	}
-	return fmt.Sprintf("$%d\r\n%s\r\n", len(s), s)
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+	b.WriteByte('$')
+	b.WriteString(strconv.Itoa(len(s)))
+	b.WriteString("\r\n")
+	b.WriteString(s)
+	b.WriteString("\r\n")
+	return b.String()
 }
+
+// encodeNull encodes a null bulk string in RESP2 format: "$-1\r\n"
+func encodeNull() string {
+	return "$-1\r\n"
+}
+
+// encodeSimpleString encodes a simple status string: +<message>\r\n
+func encodeSimpleString(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 3)
+	b.WriteByte('+')
+	b.WriteString(s)
+	b.WriteString("\r\n")
+	return b.String()
+}
+
+// encodeInteger encodes an integer: :<number>\r\n
 func encodeInteger(number int) string {
-	return fmt.Sprintf(":%d\r\n", number)
+	var b strings.Builder
+	b.Grow(16)
+	b.WriteByte(':')
+	b.WriteString(strconv.Itoa(number))
+	b.WriteString("\r\n")
+	return b.String()
 }
 
+// encodeError encodes a RESP error string: -ERR <message>\r\n
 func encodeError(message string) string {
-	return fmt.Sprintf("-ERR %s\r\n", message)
+	var b strings.Builder
+	b.Grow(len(message) + 8)
+	b.WriteString("-ERR ")
+	b.WriteString(message)
+	b.WriteString("\r\n")
+	return b.String()
 }
 
+// encodeStringArray encodes an array of bulk strings in RESP2: *<len>\r\n$<l1>\r\n<s1>...
 func encodeStringArray(arr []string) string {
-	result := fmt.Sprintf("*%d\r\n", len(arr))
+	var b strings.Builder
+	b.Grow(32 + len(arr)*32)
+	b.WriteByte('*')
+	b.WriteString(strconv.Itoa(len(arr)))
+	b.WriteString("\r\n")
 	for _, s := range arr {
-		result += encodeBulkString(s)
+		b.WriteString(encodeBulkString(s))
 	}
-	return result
+	return b.String()
 }

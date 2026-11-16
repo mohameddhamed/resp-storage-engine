@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -15,9 +16,12 @@ type replica struct {
 	conn   net.Conn
 	offset int
 }
-type Client struct {
-	connection net.Conn
-	multi      int
+
+type ClientContext struct {
+	id         int
+	conn       net.Conn
+	inMulti    bool
+	queuedCmds [][]string
 }
 
 type serverConfig struct {
@@ -29,33 +33,24 @@ type serverConfig struct {
 	replicaofPort int
 	dir           string
 	dbFileName    string
-	queuedCmds    [][]string
 }
 
-var ackReceived chan bool
+var (
+	ackReceived chan bool
 
-// var mu sync.Mutex
-var store map[string]string
-var ttl map[string]time.Time
-var config serverConfig
-var replicas []replica
+	storeMu sync.RWMutex
+	store   map[string]string
+	ttl     map[string]time.Time
 
-// var numAcknowledgedReplicas int
-// const (
-// 	opCodeAuxField   byte = 0xFA // key, value follow
-// 	opCodeSelectDB   byte = 0xFE // following byte is db number
-// 	opCodeResizeDB   byte = 0xFB // follwing are 2 length-encoded ints
-// 	opCodeTypeString byte = 0x00 // following byte(s) are length encoding
-// 	opCodeEOF        byte = 0xFF // following 8 bytes are CRC64 checksum
-// )
+	replicaMu sync.Mutex
+	replicas  []replica
+
+	config serverConfig
+)
 
 func main() {
-
-	// numAcknowledgedReplicas = 0
-
 	flag.IntVar(&config.port, "port", 6379, "listen on specified port")
 	flag.StringVar(&config.replicaofHost, "replicaof", "", "start server in replica mode of given host and port")
-
 	flag.StringVar(&config.dir, "dir", "", "the path to the directory where the RDB file is stored")
 	flag.StringVar(&config.dbFileName, "dbfilename", "", "the name of the RDB file ")
 
@@ -68,9 +63,7 @@ func main() {
 	configure()
 
 	if config.role == "slave" {
-
-		masterConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", config.replicaofHost, config.replicaofPort))
-
+		masterConn, err := net.Dial("tcp", net.JoinHostPort(config.replicaofHost, strconv.Itoa(config.replicaofPort)))
 		if err != nil {
 			fmt.Printf("Failed to connect to master %v\n", err)
 			os.Exit(1)
@@ -78,7 +71,6 @@ func main() {
 		defer masterConn.Close()
 
 		reader := handshake(masterConn)
-
 		receiveRDB(reader)
 		totalProcessedBytes := 0
 
@@ -96,133 +88,225 @@ func main() {
 	connect()
 }
 
-func handleCommand(cmd []string, byteCount int, multi *int) (response string, resynch bool) {
-	isWrite := false
-
-	fmt.Println("This is multi", *multi)
-	if *multi >= 0 {
-		*multi++
-		response = enQueue(cmd, multi)
-		return
+func handleCommand(ctx *ClientContext, cmd []string, byteCount int) (response string, resynch bool) {
+	if len(cmd) == 0 {
+		return "", false
 	}
 
-	switch strings.ToUpper(cmd[0]) {
+	cmdName := strings.ToUpper(cmd[0])
+
+	// Handle transactional state if client is in MULTI
+	if ctx != nil && ctx.inMulti {
+		switch cmdName {
+		case "EXEC":
+			queued := ctx.queuedCmds
+			ctx.inMulti = false
+			ctx.queuedCmds = nil
+
+			if len(queued) == 0 {
+				return "*0\r\n", false
+			}
+
+			var b strings.Builder
+			b.WriteString("*" + strconv.Itoa(len(queued)) + "\r\n")
+			for _, queuedCmd := range queued {
+				subResp, _ := handleCommand(ctx, queuedCmd, 0)
+				b.WriteString(subResp)
+			}
+			return b.String(), false
+
+		case "DISCARD":
+			ctx.inMulti = false
+			ctx.queuedCmds = nil
+			return "+OK\r\n", false
+
+		default:
+			ctx.queuedCmds = append(ctx.queuedCmds, cmd)
+			return "+QUEUED\r\n", false
+		}
+	}
+
+	isWrite := false
+
+	switch cmdName {
 	case "COMMAND":
 		response = "+OK\r\n"
+
 	case "REPLCONF":
 		if len(cmd) >= 2 {
-			if strings.ToUpper(cmd[1]) == "GETACK" {
+			subCmd := strings.ToUpper(cmd[1])
+			if subCmd == "GETACK" {
 				response = encodeStringArray([]string{"REPLCONF", "ACK", strconv.Itoa(byteCount)})
-
-			} else if config.role == "master" && strings.ToUpper(cmd[1]) == "ACK" {
-				// mu.Lock()
-				// numAcknowledgedReplicas++
-				// mu.Unlock()
-				ackReceived <- true
+			} else if config.role == "master" && subCmd == "ACK" {
+				select {
+				case ackReceived <- true:
+				default:
+				}
+				response = "+OK\r\n"
 			} else {
-				// TODO: Implement proper replication
 				response = "+OK\r\n"
 			}
 		}
+
 	case "PSYNC":
 		if len(cmd) == 3 {
-			// TODO: Implement synch
 			response = fmt.Sprintf("+FULLRESYNC %s 0\r\n", config.replid)
 			resynch = true
 		}
+
 	case "PING":
 		response = "+PONG\r\n"
+
 	case "ECHO":
-		response = encodeBulkString(cmd[1])
+		if len(cmd) > 1 {
+			response = encodeBulkString(cmd[1])
+		} else {
+			response = encodeError("wrong number of arguments for 'echo' command")
+		}
+
 	case "INFO":
-		if len(cmd) == 2 && strings.ToUpper(cmd[1]) == "REPLICATION" {
-			response = encodeBulkString(fmt.Sprintf("role:%s\r\nmaster_replid:%s\r\nmaster_repl_offset:%d",
-				config.role, config.replid, config.replOffset))
+		if len(cmd) >= 2 && strings.ToUpper(cmd[1]) == "REPLICATION" {
+			infoStr := fmt.Sprintf("role:%s\r\nmaster_replid:%s\r\nmaster_repl_offset:%d",
+				config.role, config.replid, config.replOffset)
+			response = encodeBulkString(infoStr)
+		} else {
+			response = encodeBulkString(fmt.Sprintf("role:%s", config.role))
 		}
+
 	case "MULTI":
-		*multi = 0
+		if ctx != nil {
+			ctx.inMulti = true
+			ctx.queuedCmds = nil
+		}
 		response = "+OK\r\n"
+
 	case "EXEC":
-		if *multi < 0 {
-			response = encodeError("EXEC without MULTI")
-		}
+		response = encodeError("EXEC without MULTI")
+
 	case "DISCARD":
-		if *multi < 0 {
-			response = encodeError("DISCARD without MULTI")
-		}
+		response = encodeError("DISCARD without MULTI")
+
 	case "SET":
+		if len(cmd) < 3 {
+			response = encodeError("wrong number of arguments for 'set' command")
+			break
+		}
 		isWrite = true
-		// TODO: check length
 		key, value := cmd[1], cmd[2]
+
+		storeMu.Lock()
 		store[key] = value
-		if len(cmd) == 5 && strings.ToUpper(cmd[3]) == "PX" {
+		if len(cmd) >= 5 && strings.ToUpper(cmd[3]) == "PX" {
 			expiration, _ := strconv.Atoi(cmd[4])
 			ttl[key] = time.Now().Add(time.Millisecond * time.Duration(expiration))
+		} else {
+			delete(ttl, key)
 		}
+		storeMu.Unlock()
 		response = "+OK\r\n"
+
 	case "GET":
-		// TODO: check length
+		if len(cmd) < 2 {
+			response = encodeError("wrong number of arguments for 'get' command")
+			break
+		}
 		key := cmd[1]
+
+		storeMu.RLock()
 		value, ok := store[key]
-		if ok {
-			expiration, exists := ttl[key]
-			if !exists || expiration.After(time.Now()) {
-				response = encodeBulkString(value)
-			} else if exists {
+		if !ok {
+			storeMu.RUnlock()
+			response = encodeNull()
+			break
+		}
+		expiration, exists := ttl[key]
+		if exists && time.Now().After(expiration) {
+			storeMu.RUnlock()
+			storeMu.Lock()
+			if exp, stillExists := ttl[key]; stillExists && time.Now().After(exp) {
 				delete(ttl, key)
 				delete(store, key)
-				response = encodeBulkString("")
 			}
-		} else {
-			response = encodeBulkString("")
+			storeMu.Unlock()
+			response = encodeNull()
+			break
 		}
+		storeMu.RUnlock()
+		response = encodeBulkString(value)
+
 	case "INCR":
-		// TODO: check length
+		if len(cmd) < 2 {
+			response = encodeError("wrong number of arguments for 'incr' command")
+			break
+		}
+		isWrite = true
 		key := cmd[1]
+
+		storeMu.Lock()
 		value, ok := store[key]
 		if ok {
 			numValue, err := strconv.Atoi(value)
-
-			// if non numerical value
 			if err != nil {
+				storeMu.Unlock()
 				response = encodeError("value is not an integer or out of range")
 				break
 			}
-
 			numValue++
 			store[key] = strconv.Itoa(numValue)
-
+			storeMu.Unlock()
 			response = encodeInteger(numValue)
 		} else {
 			store[key] = "1"
+			delete(ttl, key)
+			storeMu.Unlock()
 			response = encodeInteger(1)
 		}
+
 	case "WAIT":
-		// response = encodeInteger(len(replicas))
-		numReplicas, _ := strconv.Atoi(cmd[1])
-		timeout, _ := strconv.Atoi(cmd[2])
+		numReplicas := 0
+		timeout := 0
+		if len(cmd) >= 2 {
+			numReplicas, _ = strconv.Atoi(cmd[1])
+		}
+		if len(cmd) >= 3 {
+			timeout, _ = strconv.Atoi(cmd[2])
+		}
 		response = handleWait(numReplicas, timeout)
-		// numAcknowledgedReplicas = 0
+
 	case "KEYS":
+		storeMu.RLock()
+		now := time.Now()
 		keys := make([]string, 0, len(store))
 		for key := range store {
+			if exp, exists := ttl[key]; exists && now.After(exp) {
+				continue
+			}
 			keys = append(keys, key)
 		}
+		storeMu.RUnlock()
 		response = encodeStringArray(keys)
 
 	case "CONFIG":
-		if strings.ToLower(cmd[1]) == "get" {
+		if len(cmd) >= 3 && strings.ToLower(cmd[1]) == "get" {
 			switch strings.ToLower(cmd[2]) {
 			case "dir":
 				response = encodeStringArray([]string{"dir", config.dir})
 			case "dbfilename":
 				response = encodeStringArray([]string{"dbfilename", config.dbFileName})
+			default:
+				response = encodeStringArray([]string{})
 			}
+		} else {
+			response = encodeStringArray([]string{})
 		}
+
+	default:
+		response = encodeError(fmt.Sprintf("unknown command '%s'", cmd[0]))
 	}
+
 	if isWrite {
 		propagate(cmd)
 	}
 
-	return
+	return response, resynch
 }
